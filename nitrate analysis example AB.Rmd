@@ -1,0 +1,348 @@
+---
+title: "Nitrate analysis - PARCE 2022 lysimeter samples + CAPFERT MN176"
+author: "AB"
+date: '2023-03-13'
+output: 'html_document'
+---
+
+```{r setwd}
+#clear working environment
+rm(list=ls())
+
+#Set working directory
+#change to your own directory
+setwd("C:/Users/...")
+getwd()
+
+# TODO add code to load packages
+library(plyr)
+library(tidyverse)
+library(plater)
+library(base)
+
+```
+
+
+```{r read in meta data}
+# Read in the metadata
+
+stds <- read.csv("parce 2023.03.13 std_conc.csv", na.strings = "NA")
+stds
+#bad wells must be edited out before input into R!!
+samp.meta <- read.csv("parce 2023.03.13 metadata.csv", na.strings = "NA")
+samp.meta
+
+```
+
+
+
+```{r}
+# Get the plate names
+plate.names <- unique(samp.meta$plate)
+plate.names
+file.names <- paste(plate.names, ".csv", sep = "")
+file.names
+```
+
+
+
+```{r}
+# Function to read in plates and relabel columns 
+read_plates2 <- function(files, plate_names) {
+  d <- read_plates(files, plate_names)
+  colnames(d) <- c("plate", "well", "ID", "abs")
+  return(d)
+}
+
+#this function seems to have trouble sometimes and I'm not sure why
+#fixed by opening and re-saving files. file type is still csv, but size is reduced from 15kb to 2kb. not sure why this helps or what re-saving changes.
+#2023.03.13 files load fine if re-saved so that size is 1-2kb
+
+plates <- read_plates2(file.names, plate.names)
+plates
+
+#metadata (including dilutions "dil") is added below
+```
+
+
+```{r}
+# Remove any rows where your sample ID is NA 
+#   i.e. there was no sample, standard, or check.  The well was empty.
+plates <- subset(plates, !is.na(plates$ID))
+
+# Check to make sure you have metadata (std conc and bad wells) for all plates
+#   "FALSE" means you are missing metadata
+data.frame(plate = plate.names, 
+           in_stds_file =  plate.names %in% stds$plate)
+```
+
+
+```{r}
+#### REMOVE KNOWN BAD DATA ####
+
+# Make a unique identifier for each data point
+plates$well2 <- paste(plates$plate, plates$well, sep = "_")
+
+# Drop bad wells (entered in template)
+#plates <- plates %>% 
+#  filter(is.na(bad.wells))
+
+```
+
+
+```{r}
+#### MEAN ABSORBANCE FOR EACH SAMPLE AND STANDARD ####
+
+# Get mean of the three tech reps for each sample
+mean.abs <- plates %>%
+  dplyr::group_by(plate, ID) %>%  # add dplyr::
+  dplyr::summarise(abs = mean(abs, na.rm = T)) # some weird namespace conflict here, specify dplyr version of summmarise() function. 
+
+mean.abs
+
+```
+
+
+```{r}
+#### QUALITY CONTROL ####
+
+# Count number of technical replicates for each sample (after bad wells are removed)
+good.ct <- plates %>%
+  group_by(plate, ID) %>%
+  summarise(good = sum(!is.na(abs)))
+
+# Coefficient of variation (CV) is standard deviation divided by mean,
+#   expressed as a percent
+# Set the maximum acceptable CV for technical replicates of the same sample.
+# Samples with a CV above this threshold will be removed from your dataset.
+# Ex. 10 = remove samples with a CV greater than 10%
+cv_max <- 12
+
+# Calculate CV for each sample
+cv.dat <- plates %>%
+  group_by(plate, ID) %>%
+  summarise(sample.cv = sd(abs, na.rm = T)/mean(abs, na.rm = T)*100)
+
+# Look at the distribution of CVs for each plate
+# You can use this information to adjust your CV threshold, if desired
+dlply(cv.dat, .(plate), function(dat) 
+  hist(dat$sample.cv, main = unique(dat$plate), xlab = "CV"))
+
+# Merge the quality control info with the mean absorbance dataset
+mean.abs <- merge(mean.abs, good.ct, by = c("plate", "ID"))
+mean.abs <- merge(mean.abs, cv.dat, by = c("plate", "ID"))
+head(mean.abs)
+
+# Add 2 columns to track QC data
+mean.abs$keep <- "yes"   # Good data: yes, keep it.  Bad data: no, remove it.
+mean.abs$reason <- NA    # Fill in for bad data.
+
+# Check CV and flag samples that are over the threshold you set above
+mean.abs$keep <- ifelse(mean.abs$sample.cv > cv_max, "no", mean.abs$keep)
+mean.abs$reason <- ifelse(mean.abs$sample.cv > cv_max, "High CV", mean.abs$reason)
+
+# Check number of good replicates and flag samples with less than 2
+mean.abs$keep <- ifelse(mean.abs$good < 2, "no", mean.abs$keep)
+mean.abs$reason <- ifelse(mean.abs$good < 2, "Pipetting errors", mean.abs$reason)
+
+# Show the bad samples
+mean.abs[mean.abs$keep=="no", ]
+
+```
+
+
+```{r}
+#### MAKE STANDARD CURVES ####
+
+# Set the shared pattern of letters that identifies your standards
+std_key <- "Std"
+
+# Get the absorbance of the standards
+# Standards that did not pass QC checks are dropped
+stds.abs <- mean.abs[grepl(std_key, mean.abs$ID, fixed=TRUE)==TRUE 
+                     & mean.abs$keep=="yes",]
+
+# Add standard concentrations to dataset
+stds.abs <- merge(stds.abs, stds, by = c("plate", "ID"))
+
+# Split into a list with one dataframe for each plate
+stds.list <- split(stds.abs, stds.abs$plate)
+
+# Function to get equation and R-sq for a model
+lm_eqn <- function(m) {
+  l <- list(intcpt = format(abs(coef(m)[1]), digits = 3, scientific=FALSE),
+            slope = format(coef(m)[2], digits = 3, scientific=FALSE),
+            rsq = format(summary(m)["r.squared"], digits = 3));
+  if (coef(m)[1] >= 0)  {
+    eq <- paste("y = ", l["slope"], "x + ", l["intcpt"], ", R^2 = ", l["rsq"], sep = "")
+  } else {
+    eq <- paste("y = ", l["slope"], "x - ", l["intcpt"], ", R^2 = ", l["rsq"], sep = "")    
+  }
+}
+
+# Function to plot a standard curve with equation and R-sq
+plot.curve <- function(data, model) {
+  plot(abs ~ ppm, data, main = unique(data$plate)) +
+  abline(model) +
+  mtext(lm_eqn(model), side = 3)
+}
+
+# Set up matrix to record coefficients and max ppm for each plate's standard curve
+coeff <- matrix(data = NA, ncol = 4, nrow = length(stds.list))
+colnames(coeff)=c("plate", "intcpt", "slope", "max.abs")
+
+# Set up a matrix to record notes for each plate
+curve.notes <- matrix(data = NA, ncol = 2, nrow = length(stds.list))
+colnames(curve.notes)=c("plate", "notes")
+```
+
+
+
+
+```{r QC for standard curve}
+# Set the minimum number of standards for a curve
+# The absolute minimum to plot a straight line is 3
+# We normally use 5-6 standards
+min_stds <- 4
+
+# This loop does the following:
+# 1. Omits plates with fewer than the minimum number of standards passing QC checks
+# 2. Plots standard curves with equation and R-sq for each remaining plate
+# 3. Returns coefficients for plates with R-sq > 0.99
+# 4. Prints outcome for each plate to the console
+
+for(i in 1:length(stds.list)) {
+  # Check number of standards
+  if(length(stds.list[[i]]$ID) < min_stds) {
+    # Record the plate name
+    coeff[i, "plate"] <- names(stds.list)[i]
+    # Feedback
+    curve.notes[i, ] <- c(names(stds.list[i]), "Need to redo plate (not enough good standards)")
+  } else {
+    # Calculate curve
+    m1 <- lm(abs ~ ppm, stds.list[[i]])
+    rsq1 <- summary(m1)["r.squared"] 
+    # Plot the standard curve
+    plot.curve(stds.list[[i]], m1)
+    if (rsq1 >= 0.99) {
+      # Save the coefficients
+      coeff[i, "plate"] <- names(stds.list)[i]
+      coeff[i, 2:3] <- coef(m1)
+      coeff[i, 4] <- max(stds.list[[i]]$abs)
+      # Feedback
+      curve.notes[i, ] <- c(names(stds.list[i]), "Standard curve looks good!")
+    } else {
+        # Record the plate name
+        coeff[i, "plate"] <- names(stds.list)[i]
+        # Feedback
+        curve.notes[i, ] <- c(names(stds.list[i]), "Need to redo plate (bad standard curve)")
+      }
+      # Clean up
+    rm(m1)
+    rm(rsq1)
+  }
+}
+
+print(curve.notes)
+```
+```{r}
+#### CALCULATE CONCENTRATION OF SAMPLES ####
+
+# Remove standards from absorbance dataset
+samples <- mean.abs[grepl(std_key, mean.abs$ID, fixed=TRUE)==FALSE, ]
+
+# Add coefficients and max ppm for standard curves
+coeff <- data.frame(coeff, stringsAsFactors = FALSE)
+samples <- merge(samples, coeff, by = "plate")
+samples$intcpt <- as.numeric(samples$intcpt)
+samples$slope <- as.numeric(samples$slope)
+samples$max.abs <- as.numeric(samples$max.abs)
+
+# Add sample metadata
+samples <- merge(samples, samp.meta, by = c("plate", "ID"))
+
+# Flag data from plates with bad standard curves
+samples$keep <- ifelse(is.na(samples$intcpt), "no", samples$keep)
+samples$reason <- ifelse(is.na(samples$intcpt), "Bad standard curve", samples$reason)
+
+# If the absorbance of a sample is greater than the absorbance
+#   of the highest concentration standard, flag the data
+samples$keep <- ifelse(!is.na(samples$max.abs) & samples$abs > samples$max.abs, 
+                       "no", samples$keep)
+samples$reason <- ifelse(!is.na(samples$max.abs) & samples$abs > samples$max.abs, 
+                         "Outside linear range", samples$reason)
+samples$dil <- as.numeric(samples$dil)
+
+# Calculate conc of samples
+# Note: in the equation for the standard curve, x = ppm and y = abs
+#   abs = slope*ppm + intcpt
+# We have abs and need to solve for ppm
+#   ppm = (abs - intcpt)/slope
+# We also need to take into account the dilution factor
+samples$ppm <- with(samples, ((abs - intcpt)/slope)*dil)
+
+# Subtract ppm of appropriate soil-less check from each sample
+# These checks are included as negative controls, to account for any contamination
+#   coming from the falcon tubes, solutions, filters, etc.
+# Positive values for checks should be subtracted from the values of the samples,
+#   though if the ppm of the check is high, you should think about where the 
+#   contamination is coming from and consider redoing those samples.
+# If the calculated ppm of the check is negative:
+#   Consider whether your standards might be contaminated. Compare their absorbance
+#   to other runs.
+#   If absorbance of your standards seems reasonable, pat yourself on the back.
+#   A negative ppm value for the check means contamination was negligible.
+#   Negative values for checks should NOT be subtracted from values of the samples.
+```
+
+
+
+```{r, eval = FALSE}
+# Set the shared pattern of letters that allows you to identify checks
+check_key <- "CK"
+
+# Extract checks from dataset
+checks <- samples[grepl(check_key, samples$ID, fixed=TRUE)==TRUE, c("ID", "batch", "ppm", "keep", "reason")]
+names(checks) <- c("ck.id", "batch", "ck.ppm", "keep", "reason")
+checks # Take a look at them
+
+# Remove the checks from the sample dataset
+samples <- samples[grepl(check_key, samples$ID, fixed=TRUE)==FALSE, ]
+
+# Add checks to sample dataset as a new column, 
+#   and calculate corrected ppm for samples.
+samples <- merge(samples, checks[, 1:3], by = "batch")
+samples$ppm.corr <- ifelse(samples$ck.ppm > 0,
+                           samples$ppm - samples$ck.ppm,
+                           samples$ppm)
+
+```
+
+
+```{r}
+#### SAVE THE RESULTS ####
+
+# Set the working directory
+setwd("C:/Users/....")
+
+# Save the good data
+good.samples <- subset(samples, keep=="yes")
+write.csv(good.samples, "2023.03.13_nitrate_parce_processeddata.csv", row.names = F)
+
+# Save the samples that need to be redone
+bad.samples <- subset(samples, keep=="no")
+write.csv(bad.samples, "2023.03.13_nitrate_parce_ToRedo.csv", row.names = F)
+
+# Next you will need to read the good samples into a new script and convert ppm nitrate-N
+#   or ammonium-N in the extract into mg nitrate-N or ammonium-N per kg dry soil.
+# An example script is provided: Example_ppm_to_mg_kg.R
+
+# The calculation is as follows:
+# ppm = mg N per L extract (not mg nitrate or ammonium)
+# mg N per kg soil = ppm * (1L / 1000mL) * (mL extract) / (g dry soil) * (1000g / kg)
+# Simplified: ppm * (mL extract) / (g dry soil)
+
+#You will need soil mass and moisture data to do this calculation .
+
+```
+
